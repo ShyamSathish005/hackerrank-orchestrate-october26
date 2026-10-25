@@ -142,18 +142,36 @@ class EvidenceIndex:
 
         # Determine system_id from table name and resource prefix
         system_id = self._system_from_table(table, resource_id)
+        # If row contains record_json, parse and merge it
+        if "record_json" in row and row["record_json"]:
+            try:
+                inner = json.loads(row["record_json"])
+                if isinstance(inner, dict):
+                    row = {**inner, **row}
+            except Exception:
+                pass
+
         category = resource_id_to_category(resource_id)
 
         # Collect identifiers
         identifiers = []
-        for key in ["email", "full_name", "phone", "email_hash", "user_id",
-                     "customer_reference", "requester_email", "requester_name",
-                     "requester_phone"]:
+        for key in ["email", "customer_email", "owner_email", "requester_email",
+                     "user_id", "customer_reference", "subject_reference",
+                     "full_name", "display_name", "name", "requester_name",
+                     "phone", "owner_phone", "requester_phone", "email_hash"]:
             val = row.get(key, "")
             if val and str(val).lower() not in ("none", "null", ""):
                 identifiers.append(str(val))
 
         status = row.get("account_status", row.get("status", ""))
+        if "restore_allowed" in row and row["restore_allowed"] is not None:
+            val = row["restore_allowed"]
+            status = "ACTIVE" if str(val) in ("1", "true", "True") else "BLOCKED"
+        elif "enabled" in row and row["enabled"] is not None:
+            val = row["enabled"]
+            status = "ACTIVE" if str(val) in ("1", "true", "True") else "DISABLED"
+        elif not status:
+            status = "PRESENT"
 
         entry = {
             "system_id": system_id,
@@ -248,9 +266,10 @@ class EvidenceIndex:
         category = resource_id_to_category(resource_id)
 
         identifiers = []
-        for key in ["email", "full_name", "phone", "email_hash", "customer_reference",
-                     "customer_email", "requester_email", "requester_name", "requester_phone",
-                     "user_id", "subject_reference", "lookup_key"]:
+        for key in ["email", "owner_email", "customer_email", "requester_email",
+                     "user_id", "customer_reference", "subject_reference", "lookup_key",
+                     "full_name", "display_name", "name", "requester_name",
+                     "phone", "owner_phone", "requester_phone", "email_hash"]:
             val = obj.get(key)
             if val and str(val).lower() not in ("none", "null", ""):
                 identifiers.append(str(val))
@@ -258,7 +277,7 @@ class EvidenceIndex:
         # Check profile sub-object
         profile = obj.get("profile")
         if isinstance(profile, dict):
-            for key in ["email", "full_name", "phone", "email_hash", "customer_reference"]:
+            for key in ["email", "owner_email", "customer_email", "full_name", "display_name", "name", "phone", "email_hash", "customer_reference"]:
                 val = profile.get(key)
                 if val and str(val).lower() not in ("none", "null", ""):
                     identifiers.append(str(val))
@@ -270,8 +289,12 @@ class EvidenceIndex:
         obs_state = "PRESENT"
         if status_code == 404 or status_code == "404":
             obs_state = "ABSENT"
-        elif status and str(status).upper() == "DELETED":
+        elif status and str(status).upper() == "DELETED" and not resource_id.startswith("tombstone_"):
             obs_state = "ABSENT"
+
+        download_available = obj.get("download_available")
+        if download_available is not None:
+            obs_state = "PRESENT" if (download_available is True or str(download_available).lower() == "true") else "ABSENT"
 
         # Check for enabled/disabled data flows
         enabled = obj.get("enabled")
@@ -331,27 +354,64 @@ class EvidenceIndex:
             return "integration_service"
         return resource_id_to_system(resource_id)
 
-    # ── Log Evidence Parser ──
-
     def _parse_log_evidence(self, file_id: str, file_path: str, captured_at: str) -> None:
-        """Parse structured log files."""
+        """Parse structured log files with distributed trace correlation."""
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
         except Exception:
             return
 
+        # Pass 1: Build trace_id and batch identifier correlations
+        trace_to_ids: Dict[str, Set[str]] = {}
+        batch_to_ids: Dict[str, Set[str]] = {}
+
+        for line in lines:
+            line_str = line.strip()
+            if not line_str:
+                continue
+            m_trace = re.search(r'trace_id=([^\s]+)', line_str)
+            m_batch = re.search(r'batch=([^\s]+)', line_str)
+            ids = set()
+            for m in re.finditer(
+                r'(?:email|customer_email|owner_email|lookup_key|requester_email|'
+                r'correlation_key|subject_key)=([^\s]+)',
+                line_str,
+            ):
+                val = m.group(1).strip('"')
+                if "@" in val:
+                    ids.add(val)
+            for m in re.finditer(
+                r'(?:customer_reference|subject_reference|subject_ref|user_id)=([^\s]+)',
+                line_str,
+            ):
+                val = m.group(1).strip('"')
+                if val and val.lower() not in ("none", "null", ""):
+                    ids.add(val)
+            if ids:
+                if m_trace:
+                    trace_to_ids.setdefault(m_trace.group(1), set()).update(ids)
+                if m_batch:
+                    batch_to_ids.setdefault(m_batch.group(1), set()).update(ids)
+
         for line_num, line in enumerate(lines, 1):
             line = line.strip()
             if not line:
                 continue
-            self._parse_log_line(file_id, line, captured_at, line_num)
+            self._parse_log_line(file_id, line, captured_at, line_num, trace_to_ids, batch_to_ids)
 
-    def _parse_log_line(self, file_id: str, line: str, captured_at: str, line_num: int) -> None:
+    def _parse_log_line(
+        self,
+        file_id: str,
+        line: str,
+        captured_at: str,
+        line_num: int,
+        trace_to_ids: Optional[Dict[str, Set[str]]] = None,
+        batch_to_ids: Optional[Dict[str, Set[str]]] = None,
+    ) -> None:
         """Parse a single structured log line (key=value format)."""
         # Extract key-value pairs
         kv = {}
-        # Match key=value patterns (value can be quoted or unquoted)
         for m in re.finditer(r'(\w+)=("(?:[^"\\]|\\.)*"|[^\s]+)', line):
             key = m.group(1)
             val = m.group(2).strip('"')
@@ -361,21 +421,28 @@ class EvidenceIndex:
         if not resource_id:
             return
 
-        # Only index "completed" events or info-level observations
+        # Skip started events for resource observations
         event = kv.get("event", "")
         if "started" in event:
-            return  # Skip "started" events, wait for completion
+            return
 
         system_id = kv.get("service", resource_id_to_system(resource_id))
         category = resource_id_to_category(resource_id)
 
         identifiers = []
-        for key in ["email", "customer_email", "customer_reference", "lookup_key",
-                     "requester_email", "requester_name", "requester_phone",
-                     "subject_reference"]:
+        for key in ["email", "owner_email", "customer_email", "requester_email",
+                     "user_id", "customer_reference", "subject_reference", "subject_ref",
+                     "lookup_key", "correlation_key", "subject_key",
+                     "requester_name", "requester_phone", "phone"]:
             val = kv.get(key, "")
             if val and val.lower() not in ("none", "null", ""):
                 identifiers.append(val)
+
+        # Inherit identifiers from trace_id or batch
+        if trace_to_ids and "trace_id" in kv and kv["trace_id"] in trace_to_ids:
+            identifiers.extend(trace_to_ids[kv["trace_id"]])
+        if batch_to_ids and "batch" in kv and kv["batch"] in batch_to_ids:
+            identifiers.extend(batch_to_ids[kv["batch"]])
 
         # Determine state from log data
         obs_state = "PRESENT"
@@ -384,12 +451,15 @@ class EvidenceIndex:
         result = kv.get("result", "")
         enabled = kv.get("enabled", "")
         restore_allowed = kv.get("restore_allowed", "")
+        marker_found = kv.get("marker_found", "")
 
         if http_status == "404" or rows == "0":
             obs_state = "ABSENT"
         elif result == "miss":
             obs_state = "ABSENT"
         elif result == "hit":
+            obs_state = "PRESENT"
+        elif marker_found == "false":
             obs_state = "PRESENT"
         elif enabled == "true":
             obs_state = "ACTIVE"
@@ -399,6 +469,11 @@ class EvidenceIndex:
             obs_state = "ACTIVE"
         elif restore_allowed == "false":
             obs_state = "BLOCKED"
+        elif event in {"restore_candidate_evaluated", "restore_access_checked"}:
+            if kv.get("eligible", "").lower() == "true" and kv.get("deletion_block", "").lower() != "true":
+                obs_state = "ACTIVE"
+            elif kv.get("deletion_block", "").lower() == "true":
+                obs_state = "BLOCKED"
 
         # Extract timestamp from line
         ts_match = re.match(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)', line)
@@ -482,34 +557,34 @@ class EvidenceIndex:
 
     def _parse_pdf_evidence(self, file_id: str, file_path: str, captured_at: str) -> None:
         """
-        Extract text from PDFs using pdfplumber or PyPDF2.
-        Falls back to filename-based metadata if libraries unavailable.
+        Extract text from PDFs using pypdf, pdfplumber, or PyPDF2.
         """
         text = ""
         try:
-            import pdfplumber
-            with pdfplumber.open(file_path) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text + "\n"
-                # Also try to extract tables
-                for page in pdf.pages:
-                    tables = page.extract_tables()
-                    for table in tables:
-                        for row in table:
-                            if row:
-                                text += " | ".join(str(c) if c else "" for c in row) + "\n"
+            from pypdf import PdfReader
+            reader = PdfReader(file_path)
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
         except ImportError:
             try:
-                from PyPDF2 import PdfReader
-                reader = PdfReader(file_path)
-                for page in reader.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text + "\n"
+                import pdfplumber
+                with pdfplumber.open(file_path) as pdf:
+                    for page in pdf.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n"
             except ImportError:
-                return
+                try:
+                    from PyPDF2 import PdfReader
+                    reader = PdfReader(file_path)
+                    for page in reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n"
+                except ImportError:
+                    return
 
         if not text.strip():
             return
@@ -531,29 +606,34 @@ class EvidenceIndex:
         # Look for user_id patterns
         user_id_pattern = re.compile(r'user_(\d+)')
 
+        # Collect document-level identifiers
+        all_emails = set(email_pattern.findall(text))
+        all_user_ids = {f"user_{uid}" for uid in user_id_pattern.findall(text)}
+        doc_identifiers = list(all_emails.union(all_user_ids))
+
         # Look for status indicators
         lines = text.split("\n")
+        seen_res_in_doc = set()
+
         for line in lines:
             line = line.strip()
             if not line:
                 continue
 
             resources = resource_pattern.findall(line)
-            emails = email_pattern.findall(line)
-            user_ids = user_id_pattern.findall(line)
 
             for prefix, num in resources:
                 resource_id = f"{prefix}_{num}"
+                if resource_id in seen_res_in_doc:
+                    continue
+                seen_res_in_doc.add(resource_id)
+
                 system_id = resource_id_to_system(resource_id)
                 category = resource_id_to_category(resource_id)
 
-                identifiers = list(emails)
-                for uid_num in user_ids:
-                    identifiers.append(f"user_{uid_num}")
-
-                # Try to determine state from line context
+                # Try to determine state from text context
                 obs_state = "PRESENT"
-                line_lower = line.lower()
+                line_lower = text.lower()
                 if "not found" in line_lower or "deleted" in line_lower or "absent" in line_lower or "404" in line_lower:
                     obs_state = "ABSENT"
                 elif "anonymized" in line_lower or "anonymised" in line_lower:
@@ -573,7 +653,7 @@ class EvidenceIndex:
                     "system_id": system_id,
                     "resource_id": resource_id,
                     "category": category,
-                    "identifiers": identifiers,
+                    "identifiers": doc_identifiers,
                     "status": obs_state,
                     "captured_at": captured_at,
                     "source": "pdf_extraction",
@@ -664,7 +744,7 @@ class EvidenceIndex:
 
                 # Handle data flows
                 if resource_id.startswith("data_flow_"):
-                    if status in ("ACTIVE",) and resource_id not in seen_flows:
+                    if resource_id not in seen_flows:
                         seen_flows.add(resource_id)
                         target_email = ""
                         raw = entry.get("raw_kv", entry.get("raw", {}))
@@ -676,17 +756,19 @@ class EvidenceIndex:
                             evidence_id=file_id,
                             target_email=target_email,
                             connector_name=raw.get("connector_name", "") if isinstance(raw, dict) else "",
+                            state=status,
                         ))
                     continue
 
                 # Handle backups / restore risks
                 if resource_id.startswith("backup_"):
-                    if status in ("ACTIVE",) and resource_id not in seen_backups:
+                    if resource_id not in seen_backups:
                         seen_backups.add(resource_id)
                         restore_risks.append(RestoreRiskRecord(
                             system_id="backup_service",
                             resource_id=resource_id,
                             evidence_id=file_id,
+                            state=status,
                         ))
                     continue
 
@@ -703,7 +785,24 @@ class EvidenceIndex:
                                     DataCategory.PRODUCT_TELEMETRY.value):
                         has_pii = True
                     elif category in (DataCategory.SUPPORT_MESSAGE.value,):
-                        has_pii = True
+                        raw = entry.get("raw", entry.get("raw_kv", {}))
+                        direct_fields = (
+                            "email", "customer_email", "owner_email", "requester_email",
+                            "full_name", "display_name", "name", "requester_name",
+                            "phone", "owner_phone", "requester_phone", "email_hash",
+                        )
+                        has_pii = any(
+                            raw.get(key) and str(raw.get(key)).lower() not in ("none", "null", "")
+                            for key in direct_fields
+                        ) if isinstance(raw, dict) else False
+                        if not has_pii:
+                            has_pii = any(
+                                str(identifier).lower() in all_ids_lower
+                                and str(identifier).lower() not in {
+                                    identity.user_id.lower(),
+                                }
+                                for identifier in entry.get("identifiers", [])
+                            )
                     elif category == DataCategory.ACCOUNT_TOMBSTONE.value:
                         # Check if PII fields are populated
                         raw = entry.get("raw", {})

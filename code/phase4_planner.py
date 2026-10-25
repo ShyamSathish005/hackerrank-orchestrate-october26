@@ -76,13 +76,16 @@ class RemediationPlanner:
         # 6. integration_service (VERIFY_DATA_FLOW_DISABLED)
         # 7. backup_service (VERIFY_RESTORE_BLOCKED)
 
-        # Collect candidate verification steps from evidence_records
-        records_by_category: Dict[str, EvidenceRecord] = {}
+        # Keep every resource: multiple records can share a policy category.
+        records_by_category: Dict[str, List[EvidenceRecord]] = {}
         for rec in case.evidence_records:
-            records_by_category[rec.data_category] = rec
+            records_by_category.setdefault(rec.data_category, []).append(rec)
+        for records in records_by_category.values():
+            records.sort(key=lambda rec: (rec.system_id, rec.resource_id))
 
         # 1. Account verification (always present in complete verification)
-        account_rec = records_by_category.get(DataCategory.USER_PROFILE.value)
+        account_records = records_by_category.get(DataCategory.USER_PROFILE.value, [])
+        account_rec = account_records[0] if account_records else None
         account_res_id = account_rec.resource_id if account_rec else f"account_{case.identity.user_id if case.identity else 'unknown'}"
         account_ev_id = account_rec.evidence_id if account_rec and account_rec.evidence_id else ""
 
@@ -105,12 +108,11 @@ class RemediationPlanner:
         step_no += 1
 
         # 2. Security audit record (retained)
-        audit_rec = records_by_category.get(DataCategory.SECURITY_AUDIT_LOG.value)
-        if audit_rec and audit_rec.resource_id:
+        for audit_rec in records_by_category.get(DataCategory.SECURITY_AUDIT_LOG.value, []):
             steps.append(Step(
                 step_no=step_no,
                 phase=Phase.VERIFICATION.value,
-                system_id="security_service",
+                system_id=audit_rec.system_id,
                 resource_id=audit_rec.resource_id,
                 operation=VerificationOp.VERIFY_RECORD_PRESENT.value,
                 state=ResourceState.PRESENT.value,
@@ -119,12 +121,11 @@ class RemediationPlanner:
             step_no += 1
 
         # 3. Support message (redacted)
-        support_rec = records_by_category.get(DataCategory.SUPPORT_MESSAGE.value)
-        if support_rec and support_rec.resource_id:
+        for support_rec in records_by_category.get(DataCategory.SUPPORT_MESSAGE.value, []):
             steps.append(Step(
                 step_no=step_no,
                 phase=Phase.VERIFICATION.value,
-                system_id="support_platform",
+                system_id=support_rec.system_id,
                 resource_id=support_rec.resource_id,
                 operation=VerificationOp.VERIFY_RECORD_REDACTED.value,
                 state=ResourceState.REDACTED.value,
@@ -133,12 +134,11 @@ class RemediationPlanner:
             step_no += 1
 
         # 4. Analytics profile (anonymized)
-        analytics_rec = records_by_category.get(DataCategory.ANALYTICS_PROFILE.value)
-        if analytics_rec and analytics_rec.resource_id:
+        for analytics_rec in records_by_category.get(DataCategory.ANALYTICS_PROFILE.value, []):
             steps.append(Step(
                 step_no=step_no,
                 phase=Phase.VERIFICATION.value,
-                system_id="analytics_platform",
+                system_id=analytics_rec.system_id,
                 resource_id=analytics_rec.resource_id,
                 operation=VerificationOp.VERIFY_RECORD_ANONYMIZED.value,
                 state=ResourceState.ANONYMIZED.value,
@@ -147,12 +147,11 @@ class RemediationPlanner:
             step_no += 1
 
         # 5. Tombstone (redacted)
-        tombstone_rec = records_by_category.get(DataCategory.ACCOUNT_TOMBSTONE.value)
-        if tombstone_rec and tombstone_rec.resource_id:
+        for tombstone_rec in records_by_category.get(DataCategory.ACCOUNT_TOMBSTONE.value, []):
             steps.append(Step(
                 step_no=step_no,
                 phase=Phase.VERIFICATION.value,
-                system_id="identity_service",
+                system_id=tombstone_rec.system_id,
                 resource_id=tombstone_rec.resource_id,
                 operation=VerificationOp.VERIFY_RECORD_REDACTED.value,
                 state=ResourceState.REDACTED.value,
@@ -161,30 +160,32 @@ class RemediationPlanner:
             step_no += 1
 
         # 6. Data flow (disabled)
-        for df in case.data_flows:
-            steps.append(Step(
-                step_no=step_no,
-                phase=Phase.VERIFICATION.value,
-                system_id=df.system_id,
-                resource_id=df.resource_id,
-                operation=VerificationOp.VERIFY_DATA_FLOW_DISABLED.value,
-                state=ResourceState.DISABLED.value,
-                evidence_id=df.evidence_id or account_ev_id,
-            ))
-            step_no += 1
+        for df in sorted(case.data_flows, key=lambda item: (item.system_id, item.resource_id)):
+            if df.state == "DISABLED":
+                steps.append(Step(
+                    step_no=step_no,
+                    phase=Phase.VERIFICATION.value,
+                    system_id=df.system_id,
+                    resource_id=df.resource_id,
+                    operation=VerificationOp.VERIFY_DATA_FLOW_DISABLED.value,
+                    state=ResourceState.DISABLED.value,
+                    evidence_id=df.evidence_id or account_ev_id,
+                ))
+                step_no += 1
 
         # 7. Backup restore (blocked)
-        for rr in case.restore_risks:
-            steps.append(Step(
-                step_no=step_no,
-                phase=Phase.VERIFICATION.value,
-                system_id=rr.system_id,
-                resource_id=rr.resource_id,
-                operation=VerificationOp.VERIFY_RESTORE_BLOCKED.value,
-                state=ResourceState.BLOCKED.value,
-                evidence_id=rr.evidence_id or account_ev_id,
-            ))
-            step_no += 1
+        for rr in sorted(case.restore_risks, key=lambda item: (item.system_id, item.resource_id)):
+            if rr.state == "BLOCKED":
+                steps.append(Step(
+                    step_no=step_no,
+                    phase=Phase.VERIFICATION.value,
+                    system_id=rr.system_id,
+                    resource_id=rr.resource_id,
+                    operation=VerificationOp.VERIFY_RESTORE_BLOCKED.value,
+                    state=ResourceState.BLOCKED.value,
+                    evidence_id=rr.evidence_id or account_ev_id,
+                ))
+                step_no += 1
 
         return steps
 
@@ -258,27 +259,29 @@ class RemediationPlanner:
             elif req_act == RequiredAction.RETAIN.value:
                 retained_records.append(rec)
 
-        for df in case.data_flows:
-            findings.append((2, Step(
-                step_no=0,
-                phase=Phase.FINDING.value,
-                system_id=df.system_id,
-                resource_id=df.resource_id,
-                operation=FindingOp.REPORT_ACTIVE_DATA_FLOW.value,
-                state=ResourceState.ACTIVE.value,
-                evidence_id=df.evidence_id,
-            )))
+        for df in sorted(case.data_flows, key=lambda item: (item.system_id, item.resource_id)):
+            if df.state == "ACTIVE":
+                findings.append((2, Step(
+                    step_no=0,
+                    phase=Phase.FINDING.value,
+                    system_id=df.system_id,
+                    resource_id=df.resource_id,
+                    operation=FindingOp.REPORT_ACTIVE_DATA_FLOW.value,
+                    state=ResourceState.ACTIVE.value,
+                    evidence_id=df.evidence_id,
+                )))
 
-        for rr in case.restore_risks:
-            findings.append((3, Step(
-                step_no=0,
-                phase=Phase.FINDING.value,
-                system_id=rr.system_id,
-                resource_id=rr.resource_id,
-                operation=FindingOp.REPORT_RESTORE_RISK.value,
-                state=ResourceState.ACTIVE.value,
-                evidence_id=rr.evidence_id,
-            )))
+        for rr in sorted(case.restore_risks, key=lambda item: (item.system_id, item.resource_id)):
+            if rr.state == "ACTIVE":
+                findings.append((3, Step(
+                    step_no=0,
+                    phase=Phase.FINDING.value,
+                    system_id=rr.system_id,
+                    resource_id=rr.resource_id,
+                    operation=FindingOp.REPORT_RESTORE_RISK.value,
+                    state=ResourceState.ACTIVE.value,
+                    evidence_id=rr.evidence_id,
+                )))
 
         # Sort findings deterministically: priority asc, then system, then resource_id
         # Note: in sample cases, if restore risk is alone it's first, otherwise by priority
@@ -298,30 +301,32 @@ class RemediationPlanner:
         # 5. ANONYMIZE_RECORD
 
         # 1. Disable data flows
-        for df in case.data_flows:
-            steps.append(Step(
-                step_no=step_no,
-                phase=Phase.REMEDIATION.value,
-                system_id=df.system_id,
-                resource_id=df.resource_id,
-                operation=RemediationOp.DISABLE_DATA_FLOW.value,
-                state=ResourceState.DISABLED.value,
-                evidence_id="",
-            ))
-            step_no += 1
+        for df in sorted(case.data_flows, key=lambda item: (item.system_id, item.resource_id)):
+            if df.state == "ACTIVE":
+                steps.append(Step(
+                    step_no=step_no,
+                    phase=Phase.REMEDIATION.value,
+                    system_id=df.system_id,
+                    resource_id=df.resource_id,
+                    operation=RemediationOp.DISABLE_DATA_FLOW.value,
+                    state=ResourceState.DISABLED.value,
+                    evidence_id="",
+                ))
+                step_no += 1
 
         # 2. Block restores
-        for rr in case.restore_risks:
-            steps.append(Step(
-                step_no=step_no,
-                phase=Phase.REMEDIATION.value,
-                system_id=rr.system_id,
-                resource_id=rr.resource_id,
-                operation=RemediationOp.BLOCK_RESTORE.value,
-                state=ResourceState.BLOCKED.value,
-                evidence_id="",
-            ))
-            step_no += 1
+        for rr in sorted(case.restore_risks, key=lambda item: (item.system_id, item.resource_id)):
+            if rr.state == "ACTIVE":
+                steps.append(Step(
+                    step_no=step_no,
+                    phase=Phase.REMEDIATION.value,
+                    system_id=rr.system_id,
+                    resource_id=rr.resource_id,
+                    operation=RemediationOp.BLOCK_RESTORE.value,
+                    state=ResourceState.BLOCKED.value,
+                    evidence_id="",
+                ))
+                step_no += 1
 
         # 3. Delete records
         # Order: account_service first if account present, or export/search/support
@@ -451,28 +456,30 @@ class RemediationPlanner:
 
         # 6. Data flow disabled (VERIFY_DATA_FLOW_DISABLED)
         for df in case.data_flows:
-            steps.append(Step(
-                step_no=step_no,
-                phase=Phase.VERIFICATION.value,
-                system_id=df.system_id,
-                resource_id=df.resource_id,
-                operation=VerificationOp.VERIFY_DATA_FLOW_DISABLED.value,
-                state=ResourceState.DISABLED.value,
-                evidence_id="",
-            ))
-            step_no += 1
+            if df.state == "ACTIVE":
+                steps.append(Step(
+                    step_no=step_no,
+                    phase=Phase.VERIFICATION.value,
+                    system_id=df.system_id,
+                    resource_id=df.resource_id,
+                    operation=VerificationOp.VERIFY_DATA_FLOW_DISABLED.value,
+                    state=ResourceState.DISABLED.value,
+                    evidence_id="",
+                ))
+                step_no += 1
 
         # 7. Restore blocked (VERIFY_RESTORE_BLOCKED)
         for rr in case.restore_risks:
-            steps.append(Step(
-                step_no=step_no,
-                phase=Phase.VERIFICATION.value,
-                system_id=rr.system_id,
-                resource_id=rr.resource_id,
-                operation=VerificationOp.VERIFY_RESTORE_BLOCKED.value,
-                state=ResourceState.BLOCKED.value,
-                evidence_id="",
-            ))
-            step_no += 1
+            if rr.state == "ACTIVE":
+                steps.append(Step(
+                    step_no=step_no,
+                    phase=Phase.VERIFICATION.value,
+                    system_id=rr.system_id,
+                    resource_id=rr.resource_id,
+                    operation=VerificationOp.VERIFY_RESTORE_BLOCKED.value,
+                    state=ResourceState.BLOCKED.value,
+                    evidence_id="",
+                ))
+                step_no += 1
 
         return steps

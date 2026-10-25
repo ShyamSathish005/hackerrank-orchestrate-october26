@@ -207,11 +207,11 @@ class RuleEngine:
                 pass
 
         # Check for active data flows
-        if case.data_flows:
+        if any(df.state == "ACTIVE" for df in case.data_flows):
             has_violations = True
 
         # Check for active restore risks
-        if case.restore_risks:
+        if any(rr.state == "ACTIVE" for rr in case.restore_risks):
             has_violations = True
 
         # Gate 3: Final decision

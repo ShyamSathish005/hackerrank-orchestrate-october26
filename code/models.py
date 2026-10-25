@@ -195,6 +195,7 @@ class DataFlowRecord:
     evidence_id: str
     target_email: str = ""
     connector_name: str = ""
+    state: str = "ACTIVE"
 
 
 @dataclass
@@ -204,6 +205,7 @@ class RestoreRiskRecord:
     resource_id: str
     evidence_id: str
     target_email: str = ""
+    state: str = "ACTIVE"
 
 
 @dataclass
